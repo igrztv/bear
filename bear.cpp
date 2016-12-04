@@ -5,7 +5,6 @@
 // перенести функции по классам
 // переменные организовать в структуры
 // часовой пояс сохранять в EEPROM
-// readUntil и readBLEUntil унифицировать
 
 SYSTEM_THREAD(ENABLED);
 SYSTEM_MODE(SEMI_AUTOMATIC);
@@ -19,6 +18,8 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 
 #define USB Serial
 #define BLE Serial1
+
+#define NAME_LEN 20
 
 // NETWORK
 #define TCP_PACKET_LENGTH 256
@@ -44,19 +45,18 @@ uint8_t sound[sampleLen];
 bool tellStory = false;
 bool storyPaused = true;
 bool mustSyncStory = false;
-char storyName[20];
-char storyToSync[20];
+char storyName[NAME_LEN];
+char storyToSync[NAME_LEN];
 
 // ALARM
-
 struct Alarm {
-    uint8_t alarmDays = 0; // bits: 0 — mon, 1 — tue, … 6 — sun
-    uint8_t alarmTime[2] = {0, 0}; // [0] — hours, [1] — minutes
-    bool alarmLight = false;
-    bool alarmVibro = false;
-    bool alarmSound = false;
-    uint8_t alarmStatus = 0;
-    bool alarmIsPlayingNow = false;
+    uint8_t days = 0; // bits: 0 — mon, 1 — tue, … 6 — sun
+    uint8_t time[2] = {0, 0}; // [0] — hours, [1] — minutes
+    uint8_t status = 0;
+	bool light = false;
+    bool vibro = false;
+    bool sound = false;
+    bool isPlayingNow = false;
 } alarm;
 
 // MAIN PROGRAM
@@ -64,10 +64,10 @@ void setup() {
     
     wifiOff();
     
-    alarmTime[0] = EEPROM.read(0);
-    alarmTime[1] = EEPROM.read(1);
-    alarmDays = EEPROM.read(2);
-    alarmStatus = EEPROM.read(3);
+    alarm.time[0] = EEPROM.read(0);
+    alarm.time[1] = EEPROM.read(1);
+    alarm.days = EEPROM.read(2);
+    alarm.status = EEPROM.read(3);
     
     Time.zone(+3);
 	
@@ -163,7 +163,8 @@ char parseCMD (char c) {
         case 'r': removeFile(); BLE.println("remove"); break;
         case 'y': {
             USB.println("sync:");
-            readBLEUntil(storyToSync, 20, '\n');
+			BLE.readBytesUntil('\n', storyToSync, NAME_LEN);
+			
             if (Particle.connected() == false) {
                 USB.println("wifiOn");
                 wifiOn();
@@ -180,10 +181,10 @@ void setSSID() {
     
     WiFi.on();
     
-    char ssid[20];
-    char password[20];
-    readBLEUntil(ssid, 20, '\n');
-    readBLEUntil(password, 20, '\n');
+    char ssid[NAME_LEN];
+    char password[NAME_LEN];
+	BLE.readBytesUntil('\n', ssid, NAME_LEN);
+	BLE.readBytesUntil('\n', password, NAME_LEN);
     
     WiFi.setCredentials(ssid, password);
     
@@ -259,36 +260,28 @@ bool alarmLight = false;
 bool alarmVibro = false;
 bool alarmSound = false; */
 
-    bool foundDelimeter = false;
-    int i = 0;
-    while (!foundDelimeter) {
-        if (BLE.available()) {
-            char c = BLE.read();
-            USB.print(c);
-            if (c != '\n') {
-                if (i == 0) alarmTime[0] = c;
-                if (i == 1) alarmTime[1] = c;
-                if (i == 2) alarmDays = c;
-                if (i == 3) alarmStatus = c;
-                i++;
-            } else {
-                foundDelimeter = true;
-            }
-        }
-    }
-
-    if (i == 4) {
-        EEPROM.write(0, alarmTime[0]);
-        EEPROM.write(1, alarmTime[1]);
-        EEPROM.write(2, alarmDays);
-        EEPROM.write(3, alarmStatus);
-    }
-    
-    BLE.write(alarmTime[0]);
-    BLE.write(alarmTime[1]);
-    BLE.write(alarmDays);
-    BLE.write(alarmStatus);
-    BLE.println();
+	char buffer[6];
+	if (BLE.readBytesUntil('\0', buffer, 5) != 5) {
+		return;
+	}
+	alarm.time[0] = buffer[0];
+	alarm.time[1] = buffer[1];
+	alarm.days = buffer[2];
+	alarm.status = buffer[3];
+	if (buffer[4] != '\n') return;
+	
+	EEPROM.write(0, alarm.time[0]);
+	EEPROM.write(1, alarm.time[1]);
+	EEPROM.write(2, alarm.days);
+	EEPROM.write(3, alarm.status);
+	
+	BLE.write(alarm.time[0]);
+	BLE.write(alarm.time[1]);
+	BLE.write(alarm.days);
+	BLE.write(alarm.status);
+	BLE.println();
+		
+	USB.print(buffer);
 }
 
 void date () {
@@ -363,7 +356,7 @@ void startStory () {
         myFile.close();
     }
     
-    char filename[20];
+    char filename[NAME_LEN + 4];
     sprintf(filename, "%s.raw", storyName);
     
     if (!myFile.open(filename, O_READ)) {
@@ -380,10 +373,10 @@ void startStory () {
 
 void removeFile () {
 
-    char name[20];
-    readBLEUntil(name, 20, '\n');
+    char name[NAME_LEN];
+	BLE.readBytesUntil('\n', name, NAME_LEN);
     
-    char filename[20];
+    char filename[NAME_LEN + 4];
     sprintf(filename, "%s.raw", name);
     
     if (myFile.isOpen()) {
@@ -432,52 +425,6 @@ void checkTCP () {
     }
 }
 
-int readUntil(char* string, int maxLength, char delimeter) {
-    bool foundDelimeter = false;
-    int length = 0;
-    while (!foundDelimeter) {
-        if (USB.available()) {
-            char c = USB.read();
-            
-            USB.print(c);
-            
-            if (c != delimeter) {
-                string[length++] = c;
-            } else {
-                string[length] = 0;
-                foundDelimeter = true;
-                return length;
-            }
-            if (length == maxLength) {
-                return maxLength;
-            }
-        }
-    }
-}
-
-int readBLEUntil(char* string, int maxLength, char delimeter) {
-    bool foundDelimeter = false;
-    int length = 0;
-    while (!foundDelimeter) {
-        if (BLE.available()) {
-            char c = BLE.read();
-            
-            USB.print(c);
-            
-            if (c != delimeter) {
-                string[length++] = c;
-            } else {
-                string[length] = 0;
-                foundDelimeter = true;
-                return length;
-            }
-            if (length == maxLength) {
-                return maxLength;
-            }
-        }
-    }
-}
-
 void syncStory (char* name, int length) {
     
     // http://storage.googleapis.com/hardteddy_stories/1.raw
@@ -493,7 +440,7 @@ void syncStory (char* name, int length) {
     // client.print("GET /story/");
     client.print("GET /hardteddy_stories/");
     
-    char filename[20];
+    char filename[NAME_LEN + 4];
     sprintf(filename, "%s.raw", name);
     
     client.print(filename);
@@ -524,13 +471,13 @@ void scanDir() {
     /* stopStory();
     
     sd.vwd()->rewind();
-    char name[20];
+    char filename[NAME_LEN + 4];
     while (myFile.openNext(sd.vwd(), O_READ)) {
-        myFile.getName(name, 20);
+        myFile.getName(filename, NAME_LEN);
         myFile.close();
         
-        BLE.println(name);
-        USB.println(name);
+        BLE.println(filename);
+        USB.println(filename);
     }
     
     BLE.println("end");
@@ -579,21 +526,6 @@ void wifiOn () {
 void wifiOff () {
     WiFi.off();
 };
-
-void broadcast () {
-    
-    USB.println(WiFi.localIP());
-
-    uint8_t address[] = {192, 168, 10, 92};
-    IPAddress ipAddress( address );
-    
-    Udp.beginPacket(ipAddress, LOCAL_PORT);
-    Udp.write("mishka");
-    Udp.endPacket();
-    
-    USB.println("broadcast done");
-    
-}
 
 void waitForN () {
     while (true) {
