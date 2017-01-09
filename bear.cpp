@@ -5,7 +5,6 @@
 // перенести функции по классам
 // переменные организовать в структуры
 // часовой пояс сохранять в EEPROM
-// readUntil и readBLEUntil унифицировать
 
 SYSTEM_THREAD(ENABLED);
 SYSTEM_MODE(SEMI_AUTOMATIC);
@@ -20,12 +19,15 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 #define USB Serial
 #define BLE Serial1
 
+#define NAME_LEN 20
+
+#define MIDDLE_DAC 3102
+
 // NETWORK
 #define TCP_PACKET_LENGTH 256
-#define LOCAL_PORT 14567
-UDP Udp;
 TCPClient client;
 long int fileReceivedLength = 0;
+bool fileDownloaded = false;
 int packet = 0;
 bool tcpAtWork = false;
 
@@ -38,36 +40,44 @@ File downloadingFile;
 const uint8_t chipSelect = D5;
 
 // PLAYING SOUNDS
-#define sampleLen 8000
+#define sampleLen 4000
 int playPeriod_us = 120;
+int timeline = 0;
 uint8_t sound[sampleLen];
 bool tellStory = false;
 bool storyPaused = true;
 bool mustSyncStory = false;
-char storyName[20];
-char storyToSync[20];
+char storyName[NAME_LEN];
+
+// DOWNLOADING FILE
+struct SyncFile {
+    char name[NAME_LEN];
+    uint8_t count; // parts amount for intaractive story
+    uint8_t doneCount; // downloaded amount of parts
+} storyToSync;
 
 // ALARM
-
 struct Alarm {
-    uint8_t alarmDays = 0; // bits: 0 — mon, 1 — tue, … 6 — sun
-    uint8_t alarmTime[2] = {0, 0}; // [0] — hours, [1] — minutes
-    bool alarmLight = false;
-    bool alarmVibro = false;
-    bool alarmSound = false;
-    uint8_t alarmStatus = 0;
-    bool alarmIsPlayingNow = false;
+    uint8_t days = 0; // bits: 0 — mon, 1 — tue, … 6 — sun
+    uint8_t time[2] = {0, 0}; // [0] — hours, [1] — minutes
+    uint8_t status = 0;
+	bool light = false;
+    bool vibro = false;
+    bool sound = false;
+    bool isPlayingNow = false;
 } alarm;
+
+bool needWiFi = false;
 
 // MAIN PROGRAM
 void setup() {
     
     wifiOff();
     
-    alarmTime[0] = EEPROM.read(0);
-    alarmTime[1] = EEPROM.read(1);
-    alarmDays = EEPROM.read(2);
-    alarmStatus = EEPROM.read(3);
+    alarm.time[0] = EEPROM.read(0);
+    alarm.time[1] = EEPROM.read(1);
+    alarm.days = EEPROM.read(2);
+    alarm.status = EEPROM.read(3);
     
     Time.zone(+3);
 	
@@ -79,16 +89,14 @@ void setup() {
     pinMode(PAIR, INPUT);
     pinMode(PGLED, OUTPUT);
     
-    Udp.begin(LOCAL_PORT);
-    
-    // BLE.begin(4800);
-    // USB.begin(4800);
+    /// BLE.begin(4800);
+    /// USB.begin(4800);
     
     BLE.begin(9600);
     USB.begin(9600);
         
     if (!sd.begin(chipSelect, SPI_HALF_SPEED)) {
-        sd.initErrorHalt();
+        // sd.initErrorHalt();
     }
     
 }
@@ -104,19 +112,11 @@ void loop() {
     if (mustSyncStory) {
         if (Particle.connected()) {
             mustSyncStory = false;
-            syncStory(storyToSync, 0);
+            syncStory(storyToSync.name, storyToSync.doneCount + 1);
         }
     }
     
     // testPing();
-    
-    if (Udp.parsePacket() > 0) {
-        while(Udp.available() > 0) {
-            char c = Udp.read();
-            USB.print(c);
-        }
-        USB.println();
-    }
     
     if (tcpAtWork) {
         checkTCP();
@@ -136,16 +136,16 @@ void testPing() {
 void serialEvent() {
     while (USB.available()) {
         char c = USB.read();
+        USB.print(c);
         parseCMD(c);
-        // Serial1.print(parseCMD(c));
     }
 }
 
 void serialEvent1() {   
     while (BLE.available()) { 
         char c = BLE.read();
-        // parseCMD(c);
-        USB.print(parseCMD(c));
+        USB.print(c);
+        parseCMD(c);
     }
 }
 
@@ -155,15 +155,25 @@ char parseCMD (char c) {
         case 'p': pauseStory(); BLE.println("pause"); break;
         case 'w': toggleWifi(); BLE.println("wifi"); break;
         case 'c': setSSID(); BLE.println("wifi"); break;
-        case 'U': broadcast(); break;
+        // case 'U': broadcast(); break;
         case 'l': scanDir(); BLE.println("list"); break;
         case 't': alarmSet(); BLE.println("alarm"); break;
         case 'd': date(); BLE.println("date"); break;
         case 'h': heartBeat(); BLE.println("poll"); break;
         case 'r': removeFile(); BLE.println("remove"); break;
         case 'y': {
-            USB.println("sync:");
-            readBLEUntil(storyToSync, 20, '\n');
+            memset(storyToSync.name, 0, NAME_LEN);
+			BLE.readBytesUntil('\n', storyToSync.name, NAME_LEN);
+			storyToSync.count = BLE.parseInt();
+			if (storyToSync.count <= 1) {
+			    storyToSync.count = 1;
+			}
+			storyToSync.doneCount = 0;
+			
+			USB.println("sync:");
+			USB.printlnf("\tname: %s", storyToSync.name);
+			USB.printlnf("\tparts: %d", storyToSync.count);
+			
             if (Particle.connected() == false) {
                 USB.println("wifiOn");
                 wifiOn();
@@ -180,10 +190,12 @@ void setSSID() {
     
     WiFi.on();
     
-    char ssid[20];
-    char password[20];
-    readBLEUntil(ssid, 20, '\n');
-    readBLEUntil(password, 20, '\n');
+    char ssid[NAME_LEN];
+    char password[NAME_LEN];
+    memset(ssid, 0, NAME_LEN);
+    memset(password, 0, NAME_LEN);
+	BLE.readBytesUntil('\n', ssid, NAME_LEN);
+	BLE.readBytesUntil('\n', password, NAME_LEN);
     
     WiFi.setCredentials(ssid, password);
     
@@ -198,9 +210,10 @@ void readStory () {
     
     int hasRead = myFile.read(sound, sampleLen);
 	if (hasRead > 0) {
+        timeline++;
 		for (int i = 0; i < hasRead; i++) {
-			analogWrite(DACR, sound[i] + 2048);
-			analogWrite(DACL, sound[i] + 2048);
+			analogWrite(DACR, 2*sound[i] + MIDDLE_DAC);
+			analogWrite(DACL, 2*sound[i] + MIDDLE_DAC);
 			delayMicroseconds(playPeriod_us);
 		}
 	} else {
@@ -214,40 +227,56 @@ void heartBeat() {
     waitForN();
     
     if (tcpAtWork && fileReceivedLength > 0) {
-        BLE.print("d");
-        BLE.println(fileReceivedLength);
-        
-        USB.print("d");
-        USB.println(fileReceivedLength);
+        if (storyToSync.count > 1) { 
+            BLE.printlnf("d%s_%d:%d", storyToSync.name, storyToSync.doneCount+1, fileReceivedLength);
+            USB.printlnf("d%s_%d:%d", storyToSync.name, storyToSync.doneCount+1, fileReceivedLength);
+        } else { 
+            BLE.printlnf("d%s:%d", storyToSync.name, fileReceivedLength);
+            USB.printlnf("d%s:%d", storyToSync.name, fileReceivedLength);
+        }
     }
-    if (tellStory && !storyPaused) {
-        BLE.print("s");
-        BLE.println(storyName);
-        
-        USB.print("s");
-        USB.println(storyName);
+    if (fileDownloaded) {
+        BLE.printlnf("f%s", storyToSync.name);
+        USB.printlnf("f%s", storyToSync.name);
     }
-    if (tellStory && storyPaused) {
-        BLE.print("p");
-        BLE.println(storyName);
+    if (tellStory) {
+        BLE.printlnf("t%d", timeline);
+        USB.printlnf("t%d", timeline);
         
-        USB.print("p");
-        USB.println(storyName);
+        if (storyPaused) {
+            USB.printlnf("p%s", storyName);
+            BLE.printlnf("p%s", storyName);
+        } else {
+            USB.printlnf("s%s", storyName);
+            BLE.printlnf("s%s", storyName);
+        }
     }
+    if (Particle.connected()) {
+        USB.println("Particle.connected");
+        BLE.println("w4");
+    } else {
+        if (WiFi.ready()) {
+            USB.println("WiFi.ready");
+            BLE.println("w3");
+        } else {
+            if (WiFi.connecting()) {
+                USB.println("WiFi.connecting");
+                BLE.println("w1");
+            }
+        }
+    }
+    
+    
     // if (tellStory && storyPaused) {
     //     BLE.print("r");
     //     // BLE.println(fileReceivedLength);
     // }
+    
+    USB.printlnf("v%f", analogRead(VBAT) * 4.2 / 4095.0);
 
-    USB.print("v");
-    USB.println(analogRead(VBAT) * 4.2 / 4095.0);
-
-    if (alarmIsPlayingNow) {
-        BLE.print("a");
-        BLE.println("on");
-        
-        USB.print("a");
-        USB.println("on");
+    if (alarm.isPlayingNow) {
+        BLE.println("aon");
+        USB.println("aon");
     }
 }
 
@@ -258,37 +287,73 @@ unit8_t alarmTime[2] = {0, 0}; // [0] — hours, [1] — minutes
 bool alarmLight = false;
 bool alarmVibro = false;
 bool alarmSound = false; */
-
-    bool foundDelimeter = false;
-    int i = 0;
-    while (!foundDelimeter) {
-        if (BLE.available()) {
-            char c = BLE.read();
-            USB.print(c);
-            if (c != '\n') {
-                if (i == 0) alarmTime[0] = c;
-                if (i == 1) alarmTime[1] = c;
-                if (i == 2) alarmDays = c;
-                if (i == 3) alarmStatus = c;
-                i++;
-            } else {
-                foundDelimeter = true;
-            }
-        }
+    char buffer[6];
+    memset(buffer, 0, 6);
+    while (!BLE.available());
+    int c = BLE.peek();
+    USB.println(c, HEX);
+    if (c == 0x67) {
+        BLE.read();
+        waitForN();
+        USB.println("Get alarm time");
+    } else {
+    	if (BLE.readBytes(buffer, 5) != 5) {
+    	    USB.println("alarm:");
+    	    for (int i = 0; i < 5; i++) {
+    	        USB.println((uint8_t)buffer[i], HEX);
+    	    }
+    		return;
+    	}
+    	alarm.time[0] = buffer[0];
+    	alarm.time[1] = buffer[1];
+    	alarm.days = buffer[2];
+    	alarm.status = buffer[3];
+    	if (buffer[4] != '\n') {
+    	    USB.print("last byte not \\n:");
+    	    USB.println(buffer[4]);
+    	    return;
+    	}
+    	
+        EEPROM.write(0, alarm.time[0]);
+        EEPROM.write(1, alarm.time[1]);
+        EEPROM.write(2, alarm.days);
+        EEPROM.write(3, alarm.status);
     }
-
-    if (i == 4) {
-        EEPROM.write(0, alarmTime[0]);
-        EEPROM.write(1, alarmTime[1]);
-        EEPROM.write(2, alarmDays);
-        EEPROM.write(3, alarmStatus);
-    }
-    
-    BLE.write(alarmTime[0]);
-    BLE.write(alarmTime[1]);
-    BLE.write(alarmDays);
-    BLE.write(alarmStatus);
-    BLE.println();
+	
+	/*int h = BLE.parseInt();
+	
+	if (h)
+	
+	alarm.time[0] = BLE.parseInt();
+	alarm.time[1] = BLE.parseInt();
+	
+	char buffer[8];
+	memset(buffer, 0, 8);
+	BLE.readBytesUntil('\n', buffer, 8);
+	for (int i = 0; i < 8; i++) {
+	    if (buffer[i] == '1') {
+	        alarm.days += 1 << i;
+	    }
+	}
+	
+	memset(buffer, 0, 8);
+	BLE.readBytesUntil('\n', buffer, 5);
+	
+	alarm.status += (buffer[0] == '1') ? 1 << 0 : 0;
+	alarm.status += (buffer[1] == '1') ? 1 << 1 : 0;
+	alarm.status += (buffer[2] == '1') ? 1 << 2 : 0;
+	alarm.status += (buffer[3] == '1') ? 1 << 3 : 0;*/
+	
+	BLE.write(alarm.time[0]);
+	BLE.print('|');
+	BLE.write(alarm.time[1]);
+	BLE.print('|');
+	BLE.write(alarm.days);
+	BLE.print('|');
+	BLE.write(alarm.status);
+	BLE.println();
+		
+	// USB.print(buffer);
 }
 
 void date () {
@@ -307,11 +372,11 @@ void date () {
 
 void startStopStory () {
     
-    bool foundDelimeter = false;
+    /* bool foundDelimeter = false;
     int length = 0;
     while (!foundDelimeter) {
-        if (BLE.available()) {
-            char c = BLE.read();
+        if (BLE.available()) {         ///////////////////
+            char c = BLE.read();       ///////////////////
             
             USB.print(c);
             
@@ -322,9 +387,10 @@ void startStopStory () {
                 foundDelimeter = true;
             }
         }
-    }
+    }*/
     
-    if (length == 0) {
+    if (BLE.readBytesUntil('\n', storyName, NAME_LEN) == 0) {
+    //if (length == 0) {
         stopStory();
     } else {
         startStory();
@@ -335,9 +401,10 @@ void stopStory () {
     
     if (!tellStory) return;
     
+    analogWrite(DACR, MIDDLE_DAC);
+    analogWrite(DACL, MIDDLE_DAC);    
+    delay(100);
     digitalWrite(PGAMP, LOW);
-    analogWrite(DACR, 0);
-    analogWrite(DACL, 0);
     
     tellStory = false;
     if (myFile.isOpen()) {
@@ -363,7 +430,8 @@ void startStory () {
         myFile.close();
     }
     
-    char filename[20];
+    char filename[NAME_LEN + 4];
+    memset(filename, 0, NAME_LEN + 4);
     sprintf(filename, "%s.raw", storyName);
     
     if (!myFile.open(filename, O_READ)) {
@@ -373,6 +441,8 @@ void startStory () {
         // sd.errorHalt("opening tale.wav for read failed");
     }
     
+    timeline = 0;
+    
     USB.println("start");
     BLE.println("start");
     
@@ -380,19 +450,37 @@ void startStory () {
 
 void removeFile () {
 
-    char name[20];
-    readBLEUntil(name, 20, '\n');
+    char name[NAME_LEN];
+    memset(name, 0, NAME_LEN);
+	BLE.readBytesUntil('\n', name, NAME_LEN);
+	uint8_t count = BLE.parseInt();
+	if (count <= 1) {
+	    count = 1;
+	}
+	
+    USB.println("remove:");
+    USB.printlnf("\tname: %s", name);
+    USB.printlnf("\tparts: %d", count);
+	
+	char filename[NAME_LEN + 4];
+	memset(filename, 0, NAME_LEN + 4);
+	
+	for (uint8_t i = 1; i <= count; i++) {
+        if (count == 1) {
+            sprintf(filename, "%s.raw", name);
+        } else {
+            sprintf(filename, "%s_%d.raw", name, i);
+        }
+        
+        if (myFile.isOpen()) {
+            myFile.close();
+        }
+        
+        if (!sd.remove(filename)) {
+            USB.printlnf("failed remove: %s", filename);
+        }
+	}
     
-    char filename[20];
-    sprintf(filename, "%s.raw", name);
-    
-    if (myFile.isOpen()) {
-        myFile.close();
-    }
-
-    if (!sd.remove(filename)) {
-        USB.println("failed remove file");
-    }
 }
 
 void checkTCP () {
@@ -423,6 +511,14 @@ void checkTCP () {
         client.stop();
         tcpAtWork = false;
         
+        storyToSync.doneCount++;
+        if (storyToSync.count == storyToSync.doneCount) {
+            fileDownloaded = true; // all files downloaded
+            wifiOff();
+        } else {
+            mustSyncStory = true;
+        }
+        
         if (downloadingFile.isOpen()) {
             if (!downloadingFile.sync()) {
                 USB.println("sync() failed");
@@ -432,53 +528,7 @@ void checkTCP () {
     }
 }
 
-int readUntil(char* string, int maxLength, char delimeter) {
-    bool foundDelimeter = false;
-    int length = 0;
-    while (!foundDelimeter) {
-        if (USB.available()) {
-            char c = USB.read();
-            
-            USB.print(c);
-            
-            if (c != delimeter) {
-                string[length++] = c;
-            } else {
-                string[length] = 0;
-                foundDelimeter = true;
-                return length;
-            }
-            if (length == maxLength) {
-                return maxLength;
-            }
-        }
-    }
-}
-
-int readBLEUntil(char* string, int maxLength, char delimeter) {
-    bool foundDelimeter = false;
-    int length = 0;
-    while (!foundDelimeter) {
-        if (BLE.available()) {
-            char c = BLE.read();
-            
-            USB.print(c);
-            
-            if (c != delimeter) {
-                string[length++] = c;
-            } else {
-                string[length] = 0;
-                foundDelimeter = true;
-                return length;
-            }
-            if (length == maxLength) {
-                return maxLength;
-            }
-        }
-    }
-}
-
-void syncStory (char* name, int length) {
+void syncStory (char* name, int count) {
     
     // http://storage.googleapis.com/hardteddy_stories/1.raw
     
@@ -493,8 +543,13 @@ void syncStory (char* name, int length) {
     // client.print("GET /story/");
     client.print("GET /hardteddy_stories/");
     
-    char filename[20];
-    sprintf(filename, "%s.raw", name);
+    char filename[NAME_LEN + 4];
+    memset(filename, 0, NAME_LEN + 4);
+    if (storyToSync.count > 1) {
+        sprintf(filename, "%s_%d.raw", name, count);
+    } else {
+        sprintf(filename, "%s.raw", name);
+    }
     
     client.print(filename);
     client.println(" HTTP/1.0");
@@ -520,42 +575,24 @@ void syncStory (char* name, int length) {
 }
 
 void scanDir() {
-    
-    /* stopStory();
-    
-    sd.vwd()->rewind();
-    char name[20];
-    while (myFile.openNext(sd.vwd(), O_READ)) {
-        myFile.getName(name, 20);
-        myFile.close();
-        
-        BLE.println(name);
-        USB.println(name);
-    }
-    
-    BLE.println("end");
-    USB.println("end");*/
-    
     waitForN();
-    
+    fileDownloaded = false;
     sd.ls(&BLE, LS_R);
-    
     sd.ls(&USB, LS_R);
-    USB.println("list");
-
 }
 
 void pauseStory () {
     
-    while (!BLE.available());
-    if (BLE.read() != '\n') return;
+    waitForN();
 
     storyPaused = !storyPaused;
     if (storyPaused) {
         analogWrite(DAC1, 0);
         pinMode(DAC1, INPUT);
+        digitalWrite(PGAMP, LOW);
     } else {
         pinMode(DAC1, OUTPUT);
+        digitalWrite(PGAMP, HIGH);
     }
     
     USB.println("pause");
@@ -568,32 +605,25 @@ void toggleWifi () {
     if (Particle.connected() || WiFi.connecting() || WiFi.ready()) {
         wifiOff();
         BLE.println("off");
+        USB.println("WiFi off");
+
     } else {
         wifiOn();
         BLE.println("on");
+        USB.println("WiFi on");
     }
 };
 void wifiOn () {
+    RGB.control(false);
+    needWiFi = true;
     Particle.connect();
 };
 void wifiOff () {
+    RGB.control(true);
+    RGB.color(0, 0, 0); // turnOff RGB led
+    needWiFi = false;
     WiFi.off();
 };
-
-void broadcast () {
-    
-    USB.println(WiFi.localIP());
-
-    uint8_t address[] = {192, 168, 10, 92};
-    IPAddress ipAddress( address );
-    
-    Udp.beginPacket(ipAddress, LOCAL_PORT);
-    Udp.write("mishka");
-    Udp.endPacket();
-    
-    USB.println("broadcast done");
-    
-}
 
 void waitForN () {
     while (true) {
